@@ -2,16 +2,12 @@ import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
-import { writeFile, mkdir, rename } from "node:fs/promises";
-import { dirname } from "node:path";
 import {
   listFiles, getFile, uploadFile, shareFile, deleteFile, downloadFile, exportFile,
 } from "./drive.js";
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 const PORT = parseInt(process.env.PORT ?? "3000", 10);
-const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN ?? "";
-const TOKEN_FILE = process.env.DRIVE_TOKEN_FILE ?? "/data/google_token.json";
 
 function ok(data: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(data) }] };
@@ -21,7 +17,11 @@ function fail(err: unknown) {
   return { content: [{ type: "text" as const, text: `ERROR: ${msg}` }], isError: true };
 }
 
-function buildMcpServer(): McpServer {
+// Each request's bearer token IS the Google access token for that call — see
+// drive.ts's header comment. Minted per-portfolio via soapbox-platform's
+// /api/oauth/google-drive flow, auto-refreshed by Anthropic's credential
+// vault (mcp_oauth), so this server never stores or refreshes its own token.
+function buildMcpServer(accessToken: string): McpServer {
   const server = new McpServer({ name: "google-drive", version: VERSION });
 
   server.tool(
@@ -33,7 +33,7 @@ function buildMcpServer(): McpServer {
       pageSize: z.number().int().optional(),
     },
     async ({ query, folderId, pageSize }) => {
-      try { return ok(await listFiles({ query, folderId, pageSize })); } catch (e) { return fail(e); }
+      try { return ok(await listFiles(accessToken, { query, folderId, pageSize })); } catch (e) { return fail(e); }
     },
   );
 
@@ -42,7 +42,7 @@ function buildMcpServer(): McpServer {
     "Get metadata for a single Drive file by id (name, mimeType, webViewLink, size, modifiedTime).",
     { fileId: z.string() },
     async ({ fileId }) => {
-      try { return ok(await getFile(fileId)); } catch (e) { return fail(e); }
+      try { return ok(await getFile(accessToken, fileId)); } catch (e) { return fail(e); }
     },
   );
 
@@ -63,7 +63,7 @@ function buildMcpServer(): McpServer {
     },
     async ({ name, contentBase64, folderId, shareWithEmail, shareRole }) => {
       try {
-        const file = await uploadFile({
+        const file = await uploadFile(accessToken, {
           name,
           contentBase64,
           sourceMimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -71,7 +71,7 @@ function buildMcpServer(): McpServer {
           convertToGoogleFormat: true,
         });
         if (shareWithEmail) {
-          await shareFile({ fileId: file.id, role: shareRole ?? "writer", type: "user", emailAddress: shareWithEmail });
+          await shareFile(accessToken, { fileId: file.id, role: shareRole ?? "writer", type: "user", emailAddress: shareWithEmail });
         }
         return ok(file);
       } catch (e) { return fail(e); }
@@ -89,7 +89,7 @@ function buildMcpServer(): McpServer {
     },
     async ({ name, contentBase64, mimeType, folderId }) => {
       try {
-        return ok(await uploadFile({ name, contentBase64, sourceMimeType: mimeType, folderId, convertToGoogleFormat: false }));
+        return ok(await uploadFile(accessToken, { name, contentBase64, sourceMimeType: mimeType, folderId, convertToGoogleFormat: false }));
       } catch (e) { return fail(e); }
     },
   );
@@ -104,7 +104,7 @@ function buildMcpServer(): McpServer {
       emailAddress: z.string().optional().describe("Required when type is 'user'"),
     },
     async ({ fileId, role, type, emailAddress }) => {
-      try { return ok(await shareFile({ fileId, role, type, emailAddress })); } catch (e) { return fail(e); }
+      try { return ok(await shareFile(accessToken, { fileId, role, type, emailAddress })); } catch (e) { return fail(e); }
     },
   );
 
@@ -113,7 +113,7 @@ function buildMcpServer(): McpServer {
     "Download the raw bytes of a plain (non-Google-native) Drive file as base64.",
     { fileId: z.string() },
     async ({ fileId }) => {
-      try { return ok({ contentBase64: await downloadFile(fileId) }); } catch (e) { return fail(e); }
+      try { return ok({ contentBase64: await downloadFile(accessToken, fileId) }); } catch (e) { return fail(e); }
     },
   );
 
@@ -125,7 +125,7 @@ function buildMcpServer(): McpServer {
       exportMimeType: z.string().optional().default("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
     },
     async ({ fileId, exportMimeType }) => {
-      try { return ok({ contentBase64: await exportFile(fileId, exportMimeType ?? "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") }); } catch (e) { return fail(e); }
+      try { return ok({ contentBase64: await exportFile(accessToken, fileId, exportMimeType ?? "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") }); } catch (e) { return fail(e); }
     },
   );
 
@@ -134,72 +134,11 @@ function buildMcpServer(): McpServer {
     "Permanently delete a Drive file by id. Use with care — there is no undo via this tool.",
     { fileId: z.string() },
     async ({ fileId }) => {
-      try { await deleteFile(fileId); return ok({ deleted: true, fileId }); } catch (e) { return fail(e); }
+      try { await deleteFile(accessToken, fileId); return ok({ deleted: true, fileId }); } catch (e) { return fail(e); }
     },
   );
 
   return server;
-}
-
-// ---------------------------------------------------------------------------
-// OAuth callback (initial consent + re-consent). Guarded: only exchanges +
-// persists when the caller supplies ?key=<MCP_AUTH_TOKEN>, so a stranger who
-// starts their own consent for our client_id cannot hijack the connection.
-// ---------------------------------------------------------------------------
-async function handleCallback(url: URL, res: ServerResponse) {
-  const code = url.searchParams.get("code");
-  const key = url.searchParams.get("key");
-  const error = url.searchParams.get("error");
-
-  if (error) {
-    res.writeHead(400, { "Content-Type": "text/plain" });
-    res.end(`Google returned error: ${error}`);
-    return;
-  }
-  if (!code) {
-    res.writeHead(400, { "Content-Type": "text/plain" });
-    res.end("Missing ?code");
-    return;
-  }
-  if (!MCP_AUTH_TOKEN || key !== MCP_AUTH_TOKEN) {
-    res.writeHead(200, { "Content-Type": "text/plain" });
-    res.end(`Authorization code received. To auto-store, re-run consent with &key=<MCP_AUTH_TOKEN> appended to the redirect, or exchange this code manually:\n\ncode=${code}`);
-    return;
-  }
-
-  try {
-    const redirectUri = process.env.GOOGLE_REDIRECT_URI ?? "https://google-drive.mcp.soapbox.build/callback";
-    const resp = await fetch("https://oauth2.googleapis.com/token", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        grant_type: "authorization_code",
-        code,
-        redirect_uri: redirectUri,
-        client_id: process.env.GOOGLE_CLIENT_ID ?? "",
-        client_secret: process.env.GOOGLE_CLIENT_SECRET ?? "",
-      }),
-    });
-    const json = (await resp.json()) as { access_token?: string; refresh_token?: string; expires_in?: number; error?: string };
-    if (!resp.ok || !json.refresh_token) {
-      res.writeHead(502, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(json));
-      return;
-    }
-    await mkdir(dirname(TOKEN_FILE), { recursive: true });
-    const tmp = `${TOKEN_FILE}.tmp`;
-    await writeFile(tmp, JSON.stringify({
-      refresh_token: json.refresh_token,
-      access_token: json.access_token,
-      expires_at: Date.now() + (json.expires_in ?? 3600) * 1000,
-    }), { mode: 0o600 });
-    await rename(tmp, TOKEN_FILE);
-    res.writeHead(200, { "Content-Type": "text/plain" });
-    res.end("✅ Google Drive connection stored. You may close this tab.");
-  } catch (e) {
-    res.writeHead(500, { "Content-Type": "text/plain" });
-    res.end(`Exchange failed: ${e instanceof Error ? e.message : String(e)}`);
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -214,23 +153,15 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
     return;
   }
 
-  if (url.pathname === "/callback" && req.method === "GET") {
-    await handleCallback(url, res);
-    return;
-  }
-
   if (url.pathname === "/mcp" && (req.method === "POST" || req.method === "GET" || req.method === "DELETE")) {
-    if (MCP_AUTH_TOKEN) {
-      const auth = req.headers["authorization"] ?? "";
-      if (auth !== `Bearer ${MCP_AUTH_TOKEN}`) {
-        res.writeHead(401, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Unauthorized" }));
-        return;
-      }
-    }
+    // The incoming bearer token IS the Google access token for this call —
+    // see drive.ts's header comment. No static shared-secret check here:
+    // whichever portfolio's OAuth connection this is, its own token gates it.
+    const auth = req.headers["authorization"] ?? "";
+    const accessToken = auth.startsWith("Bearer ") ? auth.slice("Bearer ".length) : "";
 
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-    const server = buildMcpServer();
+    const server = buildMcpServer(accessToken);
     await server.connect(transport);
 
     let body: unknown;
