@@ -10,14 +10,16 @@ import { dirname } from "node:path";
 // ---------------------------------------------------------------------------
 
 const TOKEN_FILE = process.env.DRIVE_TOKEN_FILE ?? "/data/google_token.json";
-const CLIENT_ID = requireEnv("GOOGLE_CLIENT_ID");
-const CLIENT_SECRET = requireEnv("GOOGLE_CLIENT_SECRET");
 const SEED_REFRESH = process.env.GOOGLE_REFRESH_TOKEN; // used only to seed the store on first boot
 const TOKEN_URL = "https://oauth2.googleapis.com/token";
 
+// Checked lazily (only when a tool actually needs to talk to Google), not at
+// module load — so the service can deploy and pass its health check before
+// the Google Cloud OAuth app exists yet, and only fails the specific tool
+// call that needed credentials, with a clear error, instead of crash-looping.
 function requireEnv(name: string): string {
   const v = process.env[name];
-  if (!v) throw new Error(`Missing required env var ${name}`);
+  if (!v) throw new Error(`Missing required env var ${name} — OAuth app not configured yet (see README Setup).`);
   return v;
 }
 
@@ -50,8 +52,8 @@ async function doRefresh(refreshToken: string): Promise<string> {
   const body = new URLSearchParams({
     grant_type: "refresh_token",
     refresh_token: refreshToken,
-    client_id: CLIENT_ID,
-    client_secret: CLIENT_SECRET,
+    client_id: requireEnv("GOOGLE_CLIENT_ID"),
+    client_secret: requireEnv("GOOGLE_CLIENT_SECRET"),
   });
   const resp = await fetch(TOKEN_URL, {
     method: "POST",
