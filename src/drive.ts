@@ -92,16 +92,29 @@ export async function uploadFile(accessToken: string, opts: {
   };
   if (opts.folderId) metadata.parents = [opts.folderId];
 
+  // The media part MUST be the real decoded binary bytes, not the base64 text
+  // itself — Google's multipart upload endpoint does not decode
+  // Content-Transfer-Encoding on the media part (that header only means
+  // anything to email-style MIME parsers), so a body built by string-
+  // interpolating contentBase64 sends literal base64 CHARACTERS as the
+  // "file", and Drive correctly rejects them as unconvertible ("Conversion
+  // of the uploaded content to the requested output type is not supported").
+  // Confirmed live: a small enough base64 blob was silently accepted as a
+  // blank Sheet (Drive didn't bother validating it), but a real ~230KB
+  // xlsx's base64 text failed conversion outright. Build the body as a
+  // Buffer so the binary part is genuinely binary.
   const boundary = `drivempcboundary${Date.now()}`;
-  const body =
+  const preamble = Buffer.from(
     `--${boundary}\r\n` +
-    `Content-Type: application/json; charset=UTF-8\r\n\r\n` +
-    `${JSON.stringify(metadata)}\r\n` +
-    `--${boundary}\r\n` +
-    `Content-Type: ${opts.sourceMimeType}\r\n` +
-    `Content-Transfer-Encoding: base64\r\n\r\n` +
-    `${opts.contentBase64}\r\n` +
-    `--${boundary}--`;
+      `Content-Type: application/json; charset=UTF-8\r\n\r\n` +
+      `${JSON.stringify(metadata)}\r\n` +
+      `--${boundary}\r\n` +
+      `Content-Type: ${opts.sourceMimeType}\r\n\r\n`,
+    "utf-8",
+  );
+  const fileBytes = Buffer.from(opts.contentBase64, "base64");
+  const trailer = Buffer.from(`\r\n--${boundary}--`, "utf-8");
+  const body = Buffer.concat([preamble, fileBytes, trailer]);
 
   const url = new URL(`${UPLOAD_API}/files`);
   url.searchParams.set("uploadType", "multipart");
