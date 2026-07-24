@@ -17,6 +17,16 @@ function fail(err: unknown) {
   return { content: [{ type: "text" as const, text: `ERROR: ${msg}` }], isError: true };
 }
 
+// Fetches file bytes server-side from a URL another tool handed back (e.g.
+// xlsx_templater's downloadUrl), so the calling agent never has to read or
+// re-type the raw content itself. See upload_and_convert_to_sheet's docstring.
+async function fetchBase64FromUrl(url: string): Promise<string> {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Failed to fetch sourceUrl ${url}: HTTP ${res.status}`);
+  const buf = Buffer.from(await res.arrayBuffer());
+  return buf.toString("base64");
+}
+
 // Each request's bearer token IS the Google access token for that call — see
 // drive.ts's header comment. Minted per-portfolio via soapbox-platform's
 // /api/oauth/google-drive flow, auto-refreshed by Anthropic's credential
@@ -48,24 +58,30 @@ function buildMcpServer(accessToken: string): McpServer {
 
   server.tool(
     "upload_and_convert_to_sheet",
-    "Upload an already-generated .xlsx (base64) and have Drive convert it into a native, live-editable Google Sheet. " +
+    "Upload an already-generated .xlsx and have Drive convert it into a native, live-editable Google Sheet. " +
       "Use this to hand a human a shareable, collaboratively-editable copy of a file another tool already filled " +
       "(e.g. a filled Excel template) — this does NOT rebuild the spreadsheet from scratch, it converts the exact " +
       "bytes you already have. Note: Google's xlsx→Sheets conversion can flatten some Excel-specific features " +
       "(complex pivot table caches, certain conditional formats) — the original .xlsx you already have elsewhere " +
-      "remains the source of truth; this is a review/editing copy, not a replacement artifact.",
+      "remains the source of truth; this is a review/editing copy, not a replacement artifact.\n\n" +
+      "Prefer sourceUrl over contentBase64 whenever the tool that generated the file returned a downloadUrl " +
+      "(e.g. xlsx_templater's fill_opportunity_register) — this server fetches the bytes itself, so you never have " +
+      "to read or re-type the file's content. Reserve contentBase64 for bytes you already hold some other way.",
     {
       name: z.string().describe("Filename to show in Drive, e.g. 'Cascade IEA Opportunity Register.xlsx'"),
-      contentBase64: z.string().describe("Base64-encoded .xlsx bytes"),
+      sourceUrl: z.string().optional().describe("URL to fetch the .xlsx bytes from directly (e.g. a downloadUrl returned by another tool) — pass this instead of contentBase64 when you have it, so you never have to read/relay the file's content yourself"),
+      contentBase64: z.string().optional().describe("Base64-encoded .xlsx bytes — only when you don't have a sourceUrl"),
       folderId: z.string().optional().describe("Drive folder id to upload into; omitted = user's root Drive"),
       shareWithEmail: z.string().optional().describe("If given, share the resulting Sheet with this email as a writer/commenter"),
       shareRole: z.enum(["reader", "commenter", "writer"]).optional().default("writer"),
     },
-    async ({ name, contentBase64, folderId, shareWithEmail, shareRole }) => {
+    async ({ name, sourceUrl, contentBase64, folderId, shareWithEmail, shareRole }) => {
       try {
+        if (!sourceUrl && !contentBase64) throw new Error("One of sourceUrl or contentBase64 is required");
+        const resolvedBase64 = sourceUrl ? await fetchBase64FromUrl(sourceUrl) : contentBase64!;
         const file = await uploadFile(accessToken, {
           name,
-          contentBase64,
+          contentBase64: resolvedBase64,
           sourceMimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
           folderId,
           convertToGoogleFormat: true,
