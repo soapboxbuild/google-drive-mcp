@@ -1,4 +1,5 @@
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
+import { randomBytes } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
@@ -25,6 +26,30 @@ async function fetchBase64FromUrl(url: string): Promise<string> {
   if (!res.ok) throw new Error(`Failed to fetch sourceUrl ${url}: HTTP ${res.status}`);
   const buf = Buffer.from(await res.arrayBuffer());
   return buf.toString("base64");
+}
+
+// In-memory, short-lived download store for export_sheet_to_xlsx -- same
+// rationale as xlsx_templater's downloadUrl: a real workbook exported back
+// out of Sheets can be a few hundred KB of base64, and returning that inline
+// forces the agent to relay it as its own output to whatever save tool
+// comes next (files__write_binary_file). Hand back a URL instead; that
+// tool's source_url param fetches the bytes itself.
+const DOWNLOAD_TTL_MS = 15 * 60 * 1000
+const downloads = new Map<string, { content: Buffer; filename: string; mimeType: string; expiresAt: number }>()
+
+function pruneExpiredDownloads(): void {
+  const now = Date.now()
+  for (const [token, entry] of downloads) {
+    if (entry.expiresAt < now) downloads.delete(token)
+  }
+}
+
+function storeDownload(content: Buffer, filename: string, mimeType: string): string {
+  pruneExpiredDownloads()
+  const token = randomBytes(18).toString("base64url")
+  downloads.set(token, { content, filename, mimeType, expiresAt: Date.now() + DOWNLOAD_TTL_MS })
+  const base = process.env.PUBLIC_BASE_URL ?? "https://google-drive.mcp.soapbox.build"
+  return `${base}/download/${token}`
 }
 
 // Each request's bearer token IS the Google access token for that call — see
@@ -135,13 +160,21 @@ function buildMcpServer(accessToken: string): McpServer {
 
   server.tool(
     "export_sheet_to_xlsx",
-    "Export a native Google Sheet (or Doc/Slides) back to an Office format as base64 — the return path after a human has live-edited the Sheet, so the edited version can be re-saved as the .xlsx of record.",
+    "Export a native Google Sheet (or Doc/Slides) back to an Office format — the return path after a human has " +
+      "live-edited the Sheet, so the edited version can be re-saved as the .xlsx of record. Returns a downloadUrl " +
+      "(15-minute link to the raw bytes) rather than inline base64 — pass it directly as source_url to " +
+      "files__write_binary_file rather than fetching and re-relaying the content yourself.",
     {
       fileId: z.string(),
       exportMimeType: z.string().optional().default("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
     },
     async ({ fileId, exportMimeType }) => {
-      try { return ok({ contentBase64: await exportFile(accessToken, fileId, exportMimeType ?? "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") }); } catch (e) { return fail(e); }
+      try {
+        const mimeType = exportMimeType ?? "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        const contentBase64 = await exportFile(accessToken, fileId, mimeType)
+        const downloadUrl = storeDownload(Buffer.from(contentBase64, "base64"), "exported-sheet.xlsx", mimeType)
+        return ok({ downloadUrl });
+      } catch (e) { return fail(e); }
     },
   );
 
@@ -166,6 +199,23 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
   if (url.pathname === "/health" && req.method === "GET") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ status: "ok", service: "google-drive-mcp", version: VERSION }));
+    return;
+  }
+
+  if (url.pathname.startsWith("/download/") && req.method === "GET") {
+    pruneExpiredDownloads();
+    const token = url.pathname.slice("/download/".length);
+    const entry = downloads.get(token);
+    if (!entry) {
+      res.writeHead(404, { "Content-Type": "text/plain" });
+      res.end("Not found or expired");
+      return;
+    }
+    res.writeHead(200, {
+      "Content-Type": entry.mimeType,
+      "Content-Disposition": `attachment; filename="${entry.filename}"`,
+    });
+    res.end(entry.content);
     return;
   }
 
