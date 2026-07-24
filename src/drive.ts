@@ -189,6 +189,51 @@ export async function exportFile(accessToken: string, fileId: string, exportMime
   return buf.toString("base64");
 }
 
+const DOCS_API = "https://docs.googleapis.com/v1/documents";
+
+export interface DocsTextReplacement {
+  find: string;
+  replaceText: string;
+  matchCase?: boolean;
+}
+
+/** Fetch a Google Doc's plain text content (concatenated paragraph text runs). */
+export async function getDocumentText(accessToken: string, documentId: string): Promise<string> {
+  const resp = await authedFetch(accessToken, `${DOCS_API}/${documentId}`);
+  const doc = (await resp.json()) as { body?: { content?: Array<{ paragraph?: { elements?: Array<{ textRun?: { content?: string } }> } }> } };
+  const parts: string[] = [];
+  for (const el of doc.body?.content ?? []) {
+    for (const run of el.paragraph?.elements ?? []) {
+      if (run.textRun?.content) parts.push(run.textRun.content);
+    }
+  }
+  return parts.join("");
+}
+
+/**
+ * Replace literal text occurrences in a Google Doc via `replaceAllText`.
+ * IMPORTANT: this is a DIRECT edit, not a suggestion/track-changes edit — the
+ * Docs API has no facility to author suggestions (only to view existing ones
+ * on `documents.get` via SuggestionsViewMode); every write here lands as
+ * immediately-accepted content, indistinguishable from the doc owner typing
+ * it themselves. Confirmed against Google's own docs (no suggest-mode write
+ * path exists as of 2026) — do not represent this as "tracked changes" to a
+ * caller or user.
+ */
+export async function replaceTextInDocument(accessToken: string, documentId: string, replacements: DocsTextReplacement[]): Promise<void> {
+  const requests = replacements.map((r) => ({
+    replaceAllText: {
+      containsText: { text: r.find, matchCase: r.matchCase ?? true },
+      replaceText: r.replaceText,
+    },
+  }));
+  await authedFetch(accessToken, `${DOCS_API}/${documentId}:batchUpdate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ requests }),
+  });
+}
+
 const SHEETS_API = "https://sheets.googleapis.com/v4/spreadsheets";
 
 export interface SheetErrorCell {

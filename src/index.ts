@@ -5,9 +5,10 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { z } from "zod";
 import {
   listFiles, getFile, uploadFile, shareFile, deleteFile, downloadFile, exportFile, checkSheetForErrors,
+  getDocumentText, replaceTextInDocument,
 } from "./drive.js";
 
-const VERSION = "0.2.0";
+const VERSION = "0.3.0";
 const PORT = parseInt(process.env.PORT ?? "3000", 10);
 
 function ok(data: unknown) {
@@ -227,6 +228,38 @@ function buildMcpServer(accessToken: string): McpServer {
       try {
         const errors = await checkSheetForErrors(accessToken, fileId);
         return ok({ ok: errors.length === 0, errorCount: errors.length, errors });
+      } catch (e) { return fail(e); }
+    },
+  );
+
+  server.tool(
+    "get_document_text",
+    "Read a Google Doc's plain text content (paragraph text, concatenated). Requires the 'documents' OAuth scope in addition to Drive.",
+    { documentId: z.string().describe("The Doc's file id (same as a Drive fileId)") },
+    async ({ documentId }) => {
+      try { return ok({ text: await getDocumentText(accessToken, documentId) }); } catch (e) { return fail(e); }
+    },
+  );
+
+  server.tool(
+    "replace_text_in_document",
+    "Replace literal text occurrences in a Google Doc (find/replace, one or more pairs applied atomically). " +
+      "IMPORTANT: this writes DIRECT, immediately-accepted edits — the Google Docs API has no way to author " +
+      "suggestion/track-changes edits (it can only read existing suggestions via SuggestionsViewMode, never create " +
+      "them). Edits made with this tool are indistinguishable from the doc owner typing them; never describe this " +
+      "as 'track changes' or 'suggesting mode' to a user. Requires the 'documents' OAuth scope in addition to Drive.",
+    {
+      documentId: z.string().describe("The Doc's file id (same as a Drive fileId)"),
+      replacements: z.array(z.object({
+        find: z.string().describe("Exact literal text to find"),
+        replaceText: z.string().describe("Text to replace it with"),
+        matchCase: z.boolean().optional().default(true),
+      })).min(1),
+    },
+    async ({ documentId, replacements }) => {
+      try {
+        await replaceTextInDocument(accessToken, documentId, replacements);
+        return ok({ documentId, replaced: replacements.length });
       } catch (e) { return fail(e); }
     },
   );
