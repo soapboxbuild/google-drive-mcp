@@ -18,11 +18,39 @@ function fail(err: unknown) {
   return { content: [{ type: "text" as const, text: `ERROR: ${msg}` }], isError: true };
 }
 
+// sourceUrl is agent-supplied input reaching a server-side fetch() -- an SSRF
+// vector if unrestricted (an agent could point it at an internal service,
+// localhost, or a cloud metadata endpoint). Only allow the specific
+// known-safe Soapbox MCP hosts that actually hand out these download links;
+// anything else is refused before any network call is made.
+const ALLOWED_SOURCE_URL_HOSTS = new Set([
+  "xlsx-templater-mcp-production.up.railway.app",
+  "google-drive.mcp.soapbox.build",
+]);
+
+function assertAllowedSourceUrl(rawUrl: string): URL {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw new Error(`sourceUrl is not a valid URL: ${rawUrl}`);
+  }
+  if (parsed.protocol !== "https:" || !ALLOWED_SOURCE_URL_HOSTS.has(parsed.hostname)) {
+    throw new Error(
+      `sourceUrl host "${parsed.hostname}" is not an allowed Soapbox MCP download host. ` +
+        `Only downloadUrl values returned by trusted Soapbox MCP tools (e.g. xlsx_templater's ` +
+        `fill_opportunity_register) are accepted -- pass contentBase64 instead for anything else.`,
+    );
+  }
+  return parsed;
+}
+
 // Fetches file bytes server-side from a URL another tool handed back (e.g.
 // xlsx_templater's downloadUrl), so the calling agent never has to read or
 // re-type the raw content itself. See upload_and_convert_to_sheet's docstring.
 async function fetchBase64FromUrl(url: string): Promise<string> {
-  const res = await fetch(url);
+  const validated = assertAllowedSourceUrl(url);
+  const res = await fetch(validated, { redirect: "error" });
   if (!res.ok) throw new Error(`Failed to fetch sourceUrl ${url}: HTTP ${res.status}`);
   const buf = Buffer.from(await res.arrayBuffer());
   return buf.toString("base64");
@@ -89,6 +117,13 @@ function buildMcpServer(accessToken: string): McpServer {
       "bytes you already have. Note: Google's xlsx→Sheets conversion can flatten some Excel-specific features " +
       "(complex pivot table caches, certain conditional formats) — the original .xlsx you already have elsewhere " +
       "remains the source of truth; this is a review/editing copy, not a replacement artifact.\n\n" +
+      "IMPORTANT: Google Sheets has NO equivalent to Excel structured Table references " +
+      "(formulas like `Table1[[#This Row],[Column]]` or `Table1[Column]`) and cannot parse that syntax at all — " +
+      "every formula using it, and everything downstream of it, breaks into #ERROR!/#VALUE!/#N/A on conversion. " +
+      "This is not a minor fidelity loss; it silently makes every computed value in an affected workbook wrong. " +
+      "Confirmed live with a BC Hydro template that uses Table3/Table6/Variables structured references throughout " +
+      "— warn the caller/user explicitly before relying on any number in the resulting Sheet, or avoid this tool " +
+      "for that file entirely.\n\n" +
       "Prefer sourceUrl over contentBase64 whenever the tool that generated the file returned a downloadUrl " +
       "(e.g. xlsx_templater's fill_opportunity_register) — this server fetches the bytes itself, so you never have " +
       "to read or re-type the file's content. Reserve contentBase64 for bytes you already hold some other way.",
