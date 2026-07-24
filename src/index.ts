@@ -5,10 +5,10 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { z } from "zod";
 import {
   listFiles, getFile, uploadFile, shareFile, deleteFile, downloadFile, exportFile, checkSheetForErrors,
-  getDocumentText, replaceTextInDocument,
+  getDocumentText, replaceTextInDocument, markupReplaceInDocument,
 } from "./drive.js";
 
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 const PORT = parseInt(process.env.PORT ?? "3000", 10);
 
 function ok(data: unknown) {
@@ -261,6 +261,26 @@ function buildMcpServer(accessToken: string): McpServer {
         await replaceTextInDocument(accessToken, documentId, replacements);
         return ok({ documentId, replaced: replacements.length });
       } catch (e) { return fail(e); }
+    },
+  );
+
+  server.tool(
+    "markup_replace_in_document",
+    "Mark up a find/replace in a Google Doc as a visual edit: the old text is struck through and colored red " +
+      "(left in place, not deleted), and the new text is inserted right after it in blue — reads like a manual " +
+      "track-changes mark-up. NOT Google Docs' native Suggesting mode (the Docs API cannot author real " +
+      "suggestions, only view existing ones) — this is a direct edit that visually mimics one. Multiple " +
+      "replacements are applied bottom-of-document first so earlier ones' indices stay valid. Requires the " +
+      "'documents' OAuth scope in addition to Drive.",
+    {
+      documentId: z.string().describe("The Doc's file id (same as a Drive fileId)"),
+      replacements: z.array(z.object({
+        find: z.string().describe("Exact literal text to strike through"),
+        replaceText: z.string().describe("New text to insert after it, colored as an insertion"),
+      })).min(1),
+    },
+    async ({ documentId, replacements }) => {
+      try { return ok(await markupReplaceInDocument(accessToken, documentId, replacements)); } catch (e) { return fail(e); }
     },
   );
 

@@ -234,6 +234,96 @@ export async function replaceTextInDocument(accessToken: string, documentId: str
   });
 }
 
+interface TextRun { startIndex: number; endIndex: number; content: string }
+
+/** Walk the doc's structural content, returning every text run with its real index range. */
+async function getStructuralTextRuns(accessToken: string, documentId: string): Promise<TextRun[]> {
+  const resp = await authedFetch(accessToken, `${DOCS_API}/${documentId}`);
+  const doc = (await resp.json()) as {
+    body?: { content?: Array<{ paragraph?: { elements?: Array<{ startIndex: number; endIndex: number; textRun?: { content?: string } }> } }> };
+  };
+  const runs: TextRun[] = [];
+  for (const el of doc.body?.content ?? []) {
+    for (const run of el.paragraph?.elements ?? []) {
+      if (run.textRun?.content) runs.push({ startIndex: run.startIndex, endIndex: run.endIndex, content: run.textRun.content });
+    }
+  }
+  return runs;
+}
+
+/** Find the [startIndex, endIndex) span of the first occurrence of `needle` across concatenated text runs. */
+function findSpan(runs: TextRun[], needle: string): { startIndex: number; endIndex: number } | null {
+  const full = runs.map((r) => r.content).join("");
+  const pos = full.indexOf(needle);
+  if (pos === -1) return null;
+  // full[] offsets map 1:1 onto the doc's index space starting at runs[0].startIndex,
+  // since runs are contiguous text-run slices in document order.
+  const base = runs[0]?.startIndex ?? 1;
+  return { startIndex: base + pos, endIndex: base + pos + needle.length };
+}
+
+const DELETION_COLOR = { color: { rgbColor: { red: 0.71, green: 0.09, blue: 0.09 } } }; // struck-through red
+const INSERTION_COLOR = { color: { rgbColor: { red: 0.06, green: 0.36, blue: 0.65 } } }; // inserted blue
+
+export interface MarkupReplacement {
+  find: string;
+  replaceText: string;
+}
+
+/**
+ * Visually mark up a find/replace as an edit: strikes through the old text
+ * (kept in place, colored red) and inserts the new text right after it
+ * (colored blue), so the change reads like a manual track-changes mark-up.
+ * This is NOT Google Docs' native Suggesting mode — the Docs API cannot
+ * author real suggestions (see replaceTextInDocument's doc comment) — it's a
+ * direct edit that visually mimics one. The old text is left in the document;
+ * call this again with the struck-through text as `find` and delete it
+ * manually (or via a follow-up direct edit) once a reviewer has confirmed.
+ *
+ * Replacements are applied bottom-of-document first so that inserting text
+ * for one replacement never shifts the structural indices of another
+ * replacement still to be processed.
+ */
+export async function markupReplaceInDocument(accessToken: string, documentId: string, replacements: MarkupReplacement[]): Promise<{ applied: number; notFound: string[] }> {
+  const runs = await getStructuralTextRuns(accessToken, documentId);
+  const spans = replacements
+    .map((r) => ({ ...r, span: findSpan(runs, r.find) }))
+    .filter((r): r is MarkupReplacement & { span: { startIndex: number; endIndex: number } } => r.span !== null)
+    .sort((a, b) => b.span.startIndex - a.span.startIndex); // bottom-of-doc first
+
+  const notFound = replacements.filter((r) => !spans.some((s) => s.find === r.find)).map((r) => r.find);
+
+  const requests: unknown[] = [];
+  for (const { replaceText, span } of spans) {
+    requests.push({
+      updateTextStyle: {
+        range: { startIndex: span.startIndex, endIndex: span.endIndex },
+        textStyle: { strikethrough: true, foregroundColor: DELETION_COLOR },
+        fields: "strikethrough,foregroundColor",
+      },
+    });
+    requests.push({
+      insertText: { location: { index: span.endIndex }, text: replaceText },
+    });
+    requests.push({
+      updateTextStyle: {
+        range: { startIndex: span.endIndex, endIndex: span.endIndex + replaceText.length },
+        textStyle: { foregroundColor: INSERTION_COLOR },
+        fields: "foregroundColor",
+      },
+    });
+  }
+
+  if (requests.length > 0) {
+    await authedFetch(accessToken, `${DOCS_API}/${documentId}:batchUpdate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ requests }),
+    });
+  }
+  return { applied: spans.length, notFound };
+}
+
 const SHEETS_API = "https://sheets.googleapis.com/v4/spreadsheets";
 
 export interface SheetErrorCell {
