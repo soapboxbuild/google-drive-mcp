@@ -188,3 +188,68 @@ export async function exportFile(accessToken: string, fileId: string, exportMime
   const buf = Buffer.from(await resp.arrayBuffer());
   return buf.toString("base64");
 }
+
+const SHEETS_API = "https://sheets.googleapis.com/v4/spreadsheets";
+
+export interface SheetErrorCell {
+  sheet: string;
+  cell: string; // A1 notation, e.g. "Opportunity Register!P15"
+  errorType: string; // e.g. "DIVIDE_BY_ZERO", "REF", "VALUE", "N_A", "ERROR"
+  message: string;
+}
+
+function columnLetter(index: number): string {
+  let n = index + 1;
+  let s = "";
+  while (n > 0) {
+    const rem = (n - 1) % 26;
+    s = String.fromCharCode(65 + rem) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
+}
+
+/**
+ * Checks every formula cell in a live Google Sheet for a computed error value
+ * (DIV/0, REF, VALUE, N/A, NAME, NUM, ERROR) -- this is what caught the BC
+ * Hydro register's Excel-structured-table-reference incompatibility live
+ * (600+ broken cells) before it ever reached a human reviewer. Reads
+ * `effectiveValue.errorValue` from the Sheets API, which reflects Sheets'
+ * OWN recalculation -- the authoritative source, not a guess from formula
+ * text or a raw xlsx's stale cached values.
+ */
+export async function checkSheetForErrors(accessToken: string, fileId: string): Promise<SheetErrorCell[]> {
+  const url = new URL(`${SHEETS_API}/${fileId}`);
+  url.searchParams.set("includeGridData", "true");
+  url.searchParams.set("fields", "sheets(properties.title,data.rowData.values(effectiveValue))");
+  const resp = await authedFetch(accessToken, url.toString());
+  const json = (await resp.json()) as {
+    sheets: Array<{
+      properties: { title: string };
+      data?: Array<{ rowData?: Array<{ values?: Array<{ effectiveValue?: { errorValue?: { type: string; message: string } } }> }> }>;
+    }>;
+  };
+
+  const errors: SheetErrorCell[] = [];
+  for (const sheet of json.sheets ?? []) {
+    const title = sheet.properties.title;
+    for (const grid of sheet.data ?? []) {
+      const rowData = grid.rowData ?? [];
+      for (let r = 0; r < rowData.length; r++) {
+        const values = rowData[r].values ?? [];
+        for (let c = 0; c < values.length; c++) {
+          const err = values[c].effectiveValue?.errorValue;
+          if (err) {
+            errors.push({
+              sheet: title,
+              cell: `${title}!${columnLetter(c)}${r + 1}`,
+              errorType: err.type,
+              message: err.message,
+            });
+          }
+        }
+      }
+    }
+  }
+  return errors;
+}

@@ -4,7 +4,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import {
-  listFiles, getFile, uploadFile, shareFile, deleteFile, downloadFile, exportFile,
+  listFiles, getFile, uploadFile, shareFile, deleteFile, downloadFile, exportFile, checkSheetForErrors,
 } from "./drive.js";
 
 const VERSION = "0.2.0";
@@ -209,6 +209,24 @@ function buildMcpServer(accessToken: string): McpServer {
         const contentBase64 = await exportFile(accessToken, fileId, mimeType)
         const downloadUrl = storeDownload(Buffer.from(contentBase64, "base64"), "exported-sheet.xlsx", mimeType)
         return ok({ downloadUrl });
+      } catch (e) { return fail(e); }
+    },
+  );
+
+  server.tool(
+    "check_sheet_for_errors",
+    "Scan every cell of a live Google Sheet for a computed formula error (DIV/0, REF, VALUE, N/A, NAME, NUM, or a " +
+      "generic import ERROR). ALWAYS call this immediately after upload_and_convert_to_sheet and treat any non-empty " +
+      "result as a hard block — do not present the Sheet link for review/sign-off, and do not proceed to render a " +
+      "report from data pulled off it, until every error is understood and resolved (either the source data is " +
+      "wrong, or the template itself has a formula incompatible with Sheets — see " +
+      "upload_and_convert_to_sheet's docstring on structured Table references). This reads Sheets' own live, " +
+      "recalculated values (effectiveValue.errorValue) -- the authoritative source, not a guess from formula text.",
+    { fileId: z.string() },
+    async ({ fileId }) => {
+      try {
+        const errors = await checkSheetForErrors(accessToken, fileId);
+        return ok({ ok: errors.length === 0, errorCount: errors.length, errors });
       } catch (e) { return fail(e); }
     },
   );
