@@ -308,8 +308,11 @@ export async function markupReplaceInDocument(accessToken: string, documentId: s
     requests.push({
       updateTextStyle: {
         range: { startIndex: span.endIndex, endIndex: span.endIndex + replaceText.length },
-        textStyle: { foregroundColor: INSERTION_COLOR },
-        fields: "foregroundColor",
+        // insertText inherits the adjacent (struck-through) run's style, so
+        // strikethrough must be explicitly cleared here, not just colored —
+        // confirmed live: omitting it left the inserted text struck through.
+        textStyle: { foregroundColor: INSERTION_COLOR, strikethrough: false },
+        fields: "foregroundColor,strikethrough",
       },
     });
   }
